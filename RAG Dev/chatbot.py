@@ -60,24 +60,25 @@ def create_vectors_embedding():
         # Initialize Ollama embeddings (runs locally, no API calls)
         # Model: nomic-embed-text - optimized for semantic search
         embeddings = OllamaEmbeddings(model="nomic-embed-text")
-        persist_dir = "../rag_vector_store"
+        persist_dir = "./rag_vector_store"
         
         if os.path.exists(persist_dir):
             # Load existing database from disk (FAST - no re-embedding needed!)
             st.info("📂 Loading existing vector database from disk...")
             st.session_state.vectors = Chroma(
                 persist_directory=persist_dir,
-                embedding_function=embeddings
+                embedding_function=embeddings,
+                collection_metadata={"hnsw:space": "cosine"} # CHANGE: Enforce Cosine Similarity
             )
             st.success("✅ Vector database loaded!")
         else:
             # Create new database from PDFs (SLOW - first time only)
             st.info("🔄 Creating new vector database from PDFs (this may take a few minutes)...")
-            loaders = PyPDFDirectoryLoader("../documents")
+            loaders = PyPDFDirectoryLoader("./documents") # CHANGE: Path relative to execution root
             documents = loaders.load()
             
             if not documents:
-                st.error("No PDF documents found! Please add PDF files to the documents folder.")
+                st.error(f"No PDF documents found in './documents'. Current working directory: {os.getcwd()}")
                 return
             
             # Split documents into chunks for better retrieval
@@ -91,7 +92,8 @@ def create_vectors_embedding():
             st.session_state.vectors = Chroma.from_documents(
                 documents=final_documents,
                 embedding=embeddings,
-                persist_directory=persist_dir
+                persist_directory=persist_dir,
+                collection_metadata={"hnsw:space": "cosine"} # CHANGE: Enforce Cosine Similarity
             )
             st.success(f"✅ Created and saved vector database with {len(final_documents)} chunks!")
         
@@ -114,34 +116,63 @@ def create_vectors_embedding():
 #         st.session_state.vectors = FAISS.from_documents(st.session_state.final_documents, st.session_state.embeddings)
 #         st.session_state.retriever = st.session_state.vectors.as_retriever()
 
-# User input
-question = st.text_input("Enter your query from the research paper")
+# User input & Embedding Button Layout
+# vertical_alignment="bottom" ensures the button sits on the same baseline as the text input
+col1, col2 = st.columns([4, 1], vertical_alignment="bottom")
 
-# Button: Load or create vector database
-if st.button("Document Embedding"):
-    create_vectors_embedding()
-    st.write("Vector database is ready")
+with col1:
+    question = st.text_input("Enter your query from the research paper", label_visibility="visible")
 
-# Button: Add new documents to existing database
-if st.button("Add New Documents"):
-    if "vectors" not in st.session_state:
-        st.warning("Please click 'Document Embedding' button first to create the database!")
-    else:
-        st.info("Scanning for documents to add...")
-        loaders = PyPDFDirectoryLoader("../documents")
-        documents = loaders.load()
-        
-        if not documents:
-            st.error("No PDF documents found in the documents folder!")
-        else:
-            text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
-            final_documents = text_splitter.split_documents(documents)
-            
-            # Add to existing database
-            st.session_state.vectors.add_documents(final_documents)
-            st.success(f"✅ Added {len(final_documents)} new chunks to the database!")
-            
-            st.session_state.retriever = st.session_state.vectors.as_retriever()
+with col2:
+    # Button: Load or create vector database (Init)
+    if st.button("Document Embedding", use_container_width=True):
+        create_vectors_embedding()
+        st.toast("✅ Vector database is ready!", icon="🦅") # Ephemeral toast instead of permanent text
+
+# File Upload Section (Clean separator)
+st.divider()
+
+with st.expander("📂 Add New PDFs"):
+    uploaded_files = st.file_uploader("Upload PDF files", type="pdf", accept_multiple_files=True)
+    if uploaded_files:
+        if st.button("Process Uploaded PDFs", use_container_width=True):
+            if "vectors" not in st.session_state:
+                st.toast("⚠️ Please create the database first!", icon="🚫")
+            else:
+                progress_text = "Operation in progress. Please wait..."
+                my_bar = st.progress(0, text=progress_text)
+                
+                # Save uploaded files to ./documents
+                save_dir = "./documents"
+                os.makedirs(save_dir, exist_ok=True)
+                
+                saved_files_count = 0
+                for i, uploaded_file in enumerate(uploaded_files):
+                    file_path = os.path.join(save_dir, uploaded_file.name)
+                    with open(file_path, "wb") as f:
+                        f.write(uploaded_file.getbuffer())
+                    saved_files_count += 1
+                    my_bar.progress((i + 1) / len(uploaded_files))
+                
+                my_bar.empty()
+                st.toast(f"Saved {saved_files_count} files!", icon="💾")
+                
+                # Now load and embed them
+                with st.spinner("Embedding new documents..."):
+                    loaders = PyPDFDirectoryLoader(save_dir)
+                    documents = loaders.load()
+                    
+                    if not documents:
+                       st.error("Something went wrong. No documents loaded.")
+                    else:
+                        text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+                        final_documents = text_splitter.split_documents(documents)
+                        
+                        # Add to existing database
+                        st.session_state.vectors.add_documents(final_documents)
+                        st.session_state.retriever = st.session_state.vectors.as_retriever(search_type="similarity", search_kwargs={"k": 3})
+                        
+                        st.toast(f"Added {len(final_documents)} new chunks!", icon="✅")
 
 # Answer question using RAG (Retrieval-Augmented Generation)
 if question:
@@ -151,21 +182,27 @@ if question:
         # Step 1: Create document chain (combines retrieved docs with LLM)
         document_chain = create_stuff_documents_chain(chatgroq, prompt)
         
-        # Step 2: Get retriever (finds relevant document chunks via similarity search)
-        retriever = st.session_state.vectors.as_retriever()  
+        # Step 2: Get retriever
+        retriever = st.session_state.vectors.as_retriever(search_type="similarity", search_kwargs={"k": 3})
         
-        # Step 3: Create retrieval chain (full RAG pipeline)
-        # This will: 1) Embed question, 2) Find similar chunks, 3) Send to LLM with prompt
+        # Step 3: Create retrieval chain
         retrieval_chain = create_retrieval_chain(retriever, document_chain)  
         
-        # Step 4: Get answer from the RAG pipeline
+        # Step 4: Get answer
         response = retrieval_chain.invoke({"input": question})
         
-        # Display the generated answer
+        # Display Answer FIRST (User Request)
+        st.markdown("### 🤖 Answer")
         st.write(response['answer'])
+        st.write("-----------------------")
+
+        # Display Context & Scores SECOND
+        st.markdown("### 🔍 Context & Similarity Scores")
         
-        # Show which document chunks were used (for transparency)
-        with st.expander('Document similarity search'):
-            for i, doc in enumerate(response['context']):
+        # We need to re-run the score search to get the numbers (since retrieval_chain doesn't return scores)
+        results_with_scores = st.session_state.vectors.similarity_search_with_relevance_scores(question, k=3)
+        
+        for i, (doc, score) in enumerate(results_with_scores):
+            with st.expander(f"Rank {i+1} (Score: {score:.4f})"):
                 st.write(doc.page_content)
-                st.write('-----------------------')
+                st.markdown(f"**Similarity Score:** `{score:.4f}`")
