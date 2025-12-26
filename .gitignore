@@ -14,3 +14,4 @@ wheels/
 *.sqlite
 faiss_index/
 chroma_db/
+rag_vector_store/
