@@ -15,3 +15,6 @@ wheels/
 faiss_index/
 chroma_db/
 rag_vector_store/
+
+# Dev tools
+src/inspect_db.py

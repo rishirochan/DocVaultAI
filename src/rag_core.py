@@ -1,12 +1,14 @@
 import os
+import re
 from dotenv import load_dotenv
 from langchain_groq import ChatGroq
 from langchain_community.embeddings import OllamaEmbeddings
-from langchain_community.vectorstores import Chroma 
+from langchain_chroma import Chroma 
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_community.document_loaders import PyPDFDirectoryLoader
-from langchain_community.document_loaders import PyPDFLoader
+from langchain_experimental.text_splitter import SemanticChunker
+from langchain_community.document_loaders import PyMuPDFLoader
+from langchain_core.documents import Document
 
 # Define Project Roots
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -31,6 +33,120 @@ def get_embeddings():
     """Initialize and return the Ollama embeddings model."""
     return OllamaEmbeddings(model="nomic-embed-text")
 
+def clean_document_text(text):
+    """
+    Clean document text by removing:
+    - Inline citations: [1], [2,3], [1-5]
+    - Author-year citations: (Smith, 2020), (Smith et al., 2020)
+    - Page numbers (standalone lines with just numbers)
+    - Page headers like "Page 5 of 10"
+    - Reference section markers and bibliography entries
+    """
+    # Remove inline numeric citations: [1], [2,3], [1-5], [12]
+    text = re.sub(r'\[\d+(?:[\-,]\s*\d+)*\]', '', text)
+    
+    # Remove author-year citations: (Smith, 2020), (Smith et al., 2020)
+    text = re.sub(r'\([A-Z][a-z]+\s+et\s+al\.?,?\s*\d{4}\)', '', text)
+    text = re.sub(r'\([A-Z][a-z]+,?\s*\d{4}\)', '', text)
+    
+    # Remove standalone page numbers (lines that are just 1-3 digits)
+    text = re.sub(r'^\s*\d{1,3}\s*$', '', text, flags=re.MULTILINE)
+    
+    # Remove "Page X" or "Page X of Y" patterns
+    text = re.sub(r'[Pp]age\s+\d+(\s+of\s+\d+)?', '', text)
+    
+    # Remove common reference section headers (entire line)
+    text = re.sub(r'^(References|Bibliography|Works Cited|Citations)\s*$', '', text, flags=re.MULTILINE | re.IGNORECASE)
+    
+    # Remove bibliography-style entries (lines that look like author lists)
+    # Pattern: "LastName, F. M." or "LastName, FirstName" type entries
+    text = re.sub(r'^[A-Z][a-z]+,\s*[A-Z]\..*$', '', text, flags=re.MULTILINE)
+    
+    # Remove lines that are mostly author initials like "Wang, L. C. Lima, C."
+    text = re.sub(r'^[A-Z][a-z]+,\s*[A-Z]\.\s*[A-Z]?\.?.*$', '', text, flags=re.MULTILINE)
+    
+    # Remove arXiv/DOI references
+    text = re.sub(r'arXiv:\d+\.\d+', '', text)
+    text = re.sub(r'doi:\s*\S+', '', text, flags=re.IGNORECASE)
+    
+    # Clean up excessive whitespace
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    text = re.sub(r' {2,}', ' ', text)
+    
+    return text.strip()
+
+def get_semantic_chunks(documents, max_chunk_size=1500, min_chunk_size=200):
+    """
+    Recursive Semantic Chunking:
+    1. Clean text (remove citations, page numbers, references)
+    2. Split by topic shifts using SemanticChunker
+    3. Merge tiny chunks, split oversized chunks
+    """
+    # Step 0: Clean each document's text
+    for doc in documents:
+        doc.page_content = clean_document_text(doc.page_content)
+    
+    # Filter out documents with very little content after cleaning
+    documents = [doc for doc in documents if len(doc.page_content.strip()) > 50]
+    
+    if not documents:
+        return []
+    
+    embeddings = get_embeddings()
+    
+    # Step 1: Semantic split by topic (higher threshold = fewer, larger chunks)
+    semantic_splitter = SemanticChunker(
+        embeddings,
+        breakpoint_threshold_type="percentile",
+        breakpoint_threshold_amount=95.0,  # Higher = fewer splits
+        buffer_size=3  # Group more sentences together
+    )
+    semantic_chunks = semantic_splitter.split_documents(documents)
+    
+    # Step 2: Handle chunk sizes
+    fallback_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=max_chunk_size,
+        chunk_overlap=200,
+        separators=["\n\n", "\n", " ", ""]
+    )
+    
+    final_chunks = []
+    accumulated_text = ""
+    accumulated_metadata = None
+    
+    for chunk in semantic_chunks:
+        content = chunk.page_content.strip()
+        
+        # Skip empty chunks
+        if len(content) < 10:
+            continue
+        
+        # If chunk is too small, accumulate it
+        if len(content) < min_chunk_size:
+            accumulated_text += "\n\n" + content if accumulated_text else content
+            if accumulated_metadata is None:
+                accumulated_metadata = chunk.metadata
+        else:
+            # First, flush any accumulated small chunks
+            if accumulated_text:
+                merged_doc = Document(page_content=accumulated_text, metadata=accumulated_metadata or {})
+                final_chunks.append(merged_doc)
+                accumulated_text = ""
+                accumulated_metadata = None
+            
+            # Handle current chunk
+            if len(content) > max_chunk_size:
+                final_chunks.extend(fallback_splitter.split_documents([chunk]))
+            else:
+                final_chunks.append(chunk)
+    
+    # Flush any remaining accumulated text
+    if accumulated_text and len(accumulated_text) >= min_chunk_size:
+        merged_doc = Document(page_content=accumulated_text, metadata=accumulated_metadata or {})
+        final_chunks.append(merged_doc)
+    
+    return final_chunks
+
 def load_vector_store(persist_dir=VECTOR_STORE_DIR):
     """
     Attempt to load an existing Chroma vector store from disk.
@@ -50,14 +166,18 @@ def create_vector_store(doc_dir=DOCS_DIR, persist_dir=VECTOR_STORE_DIR):
     Create a new Chroma vector store from PDFs in the specified directory.
     Returns the new vector store.
     """
-    loaders = PyPDFDirectoryLoader(doc_dir)
-    documents = loaders.load()
+    # Load all PDFs in directory using PyMuPDF
+    documents = []
+    for filename in os.listdir(doc_dir):
+        if filename.lower().endswith('.pdf'):
+            file_path = os.path.join(doc_dir, filename)
+            loader = PyMuPDFLoader(file_path)
+            documents.extend(loader.load())
     
     if not documents:
         return None, 0
-    
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
-    final_documents = text_splitter.split_documents(documents)
+
+    final_documents = get_semantic_chunks(documents)
     
     vector_store = Chroma.from_documents(
         documents=final_documents,
@@ -73,14 +193,18 @@ def add_documents_to_store(doc_dir, vector_store):
     Load PDFs from doc_dir, split them, and add to the existing vector_store.
     Returns the number of chunks added.
     """
-    loaders = PyPDFDirectoryLoader(doc_dir)
-    documents = loaders.load()
+    # Load all PDFs in directory using PyMuPDF
+    documents = []
+    for filename in os.listdir(doc_dir):
+        if filename.lower().endswith('.pdf'):
+            file_path = os.path.join(doc_dir, filename)
+            loader = PyMuPDFLoader(file_path)
+            documents.extend(loader.load())
     
     if not documents:
         return 0
-        
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
-    final_documents = text_splitter.split_documents(documents)
+    
+    final_documents = get_semantic_chunks(documents)
     
     vector_store.add_documents(final_documents)
     return len(final_documents)
@@ -162,14 +286,13 @@ def add_files_to_store(file_paths, vector_store):
         if filename in indexed_sources:
             skipped += 1
             continue
-        loader = PyPDFLoader(file_path)
+        loader = PyMuPDFLoader(file_path)
         all_documents.extend(loader.load())
     
     if not all_documents:
         return 0, skipped
-        
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
-    final_documents = text_splitter.split_documents(all_documents)
+    
+    final_documents = get_semantic_chunks(all_documents)
     
     vector_store.add_documents(final_documents)
     return len(final_documents), skipped
