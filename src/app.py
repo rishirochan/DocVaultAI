@@ -42,19 +42,24 @@ with st.sidebar:
             st.markdown('<p class="status-active">● Database ready</p>', unsafe_allow_html=True)
     else:
         st.markdown('<p class="status-inactive">○ No database</p>', unsafe_allow_html=True)
-        if st.button("Initialize Database", use_container_width=True):
-            progress = st.progress(0, text="Loading documents...")
-            progress.progress(25, text="Loading documents...")
-            vector_store, num_chunks = rag_core.create_vector_store()
-            progress.progress(75, text="Creating embeddings...")
-            if vector_store:
-                progress.progress(100, text="Done!")
-                st.session_state.vectors = vector_store
-                st.success(f"✅ Created database with {num_chunks} chunks")
+        st.caption("Upload PDFs to get started")
+        
+        # File uploader for first documents
+        uploaded_files = st.file_uploader(
+            "Add PDFs",
+            type="pdf",
+            accept_multiple_files=True,
+            label_visibility="collapsed",
+            key="initial_upload"
+        )
+        
+        if uploaded_files:
+            st.caption(f"{len(uploaded_files)} file(s) ready")
+            if st.button("Upload & Initialize", use_container_width=True, type="primary"):
+                st.session_state.processing = True
+                st.session_state.new_files = uploaded_files
                 st.rerun()
-            else:
-                progress.empty()
-                st.error(f"No PDFs found in documents folder")
+    
     st.markdown("---")
     
     # Document Management
@@ -154,22 +159,31 @@ question = st.text_input(
 # Response
 if question:
     if st.session_state.vectors is None:
-        st.info("Please initialize the database first (sidebar)")
+        st.info("Please upload documents to get started (sidebar)")
     else:
-        with st.spinner(""):
-            response = rag_core.get_rag_chain_response(st.session_state.vectors, question)
-            answer = response.get("answer", "No answer found.")
+        # Check if database has documents
+        try:
+            chunk_count = st.session_state.vectors._collection.count()
+        except:
+            chunk_count = 0
         
-        st.markdown(f"""
-        <div class="response-box">
-            {answer}
-        </div>
-        """, unsafe_allow_html=True)
-        
-        # Sources
-        with st.expander("View sources", expanded=False):
-            results = rag_core.get_similarity_scores(st.session_state.vectors, question)
-            for i, (doc, score) in enumerate(results):
-                st.markdown(f"**Source {i+1}** (relevance: {score:.2f})")
-                st.caption(doc.page_content[:500] + "..." if len(doc.page_content) > 500 else doc.page_content)
-                st.markdown("---")
+        if chunk_count == 0:
+            st.info("No documents indexed yet. Add PDFs from the sidebar.")
+        else:
+            with st.spinner(""):
+                response = rag_core.get_rag_chain_response(st.session_state.vectors, question)
+                answer = response.get("answer", "No answer found.")
+            
+            st.markdown(f"""
+            <div class="response-box">
+                {answer}
+            </div>
+            """, unsafe_allow_html=True)
+            
+            # Sources
+            with st.expander("View sources", expanded=False):
+                results = rag_core.get_similarity_scores(st.session_state.vectors, question)
+                for i, (doc, score) in enumerate(results):
+                    st.markdown(f"**Source {i+1}** (relevance: {score:.2f})")
+                    st.caption(doc.page_content[:500] + "..." if len(doc.page_content) > 500 else doc.page_content)
+                    st.markdown("---")
