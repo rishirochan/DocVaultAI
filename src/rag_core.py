@@ -9,6 +9,8 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_experimental.text_splitter import SemanticChunker
 from langchain_community.document_loaders import PyMuPDFLoader
 from langchain_core.documents import Document
+import torch
+from sentence_transformers import CrossEncoder
 
 # Define Project Roots
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -19,6 +21,9 @@ ENV_PATH = os.path.join(PROJECT_ROOT, ".env")
 
 # Load environment variables
 load_dotenv(ENV_PATH)
+
+# Initialize reranker at startup (eager load for faster first query)
+RERANKER = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2', activation_fn=torch.nn.Sigmoid())
 
 def get_llm():
     """Initialize and return the Groq LLM."""
@@ -32,6 +37,22 @@ def get_llm():
 def get_embeddings():
     """Initialize and return the Ollama embeddings model."""
     return OllamaEmbeddings(model="nomic-embed-text")
+
+def rerank_documents(query, documents, top_k=3, min_score=0.3):
+    """Rerank documents using Cross-Encoder .rank() and return top_k results above min_score."""
+    if not documents:
+        return []
+    
+    # Extract content for ranking
+    passages = [doc.page_content for doc, _ in documents]
+    
+    # Use built-in .rank() method (handles sorting internally)
+    ranks = RERANKER.rank(query, passages, top_k=top_k, return_documents=False)
+    
+    # Filter by minimum score and reconstruct (Document, score) tuples
+    results = [(documents[r['corpus_id']][0], r['score']) for r in ranks if r['score'] >= min_score]
+    
+    return results
 
 def clean_document_text(text):
     """
@@ -299,19 +320,22 @@ def add_files_to_store(file_paths, vector_store):
 
 def get_rag_chain_response(vector_store, question):
     """
-    Create the RAG chain and invoke it with the question.
-    Returns the full response dictionary.
+    Create the RAG chain with reranking and invoke it with the question.
+    Fetches k=20 candidates, reranks with Cross-Encoder, uses top 3 for context.
     """
     llm = get_llm()
-    retriever = vector_store.as_retriever(search_type="similarity", search_kwargs={"k": 3})
     
-    # Retrieve relevant documents
-    docs = retriever.invoke(question)
+    # Step 1: Retrieve more candidates (k=20) for reranking
+    initial_results = vector_store.similarity_search_with_relevance_scores(question, k=20)
     
-    # Format context from documents
+    # Step 2: Rerank and get top 3
+    reranked = rerank_documents(question, initial_results, top_k=3)
+    
+    # Step 3: Format context from reranked documents
+    docs = [doc for doc, _ in reranked]
     context = "\n\n".join([doc.page_content for doc in docs])
     
-    # Create prompt and get response
+    # Step 4: Create prompt and get response
     prompt = ChatPromptTemplate.from_messages([
         ("system", "Answer the question based on the context provided only. Be accurate and concise."),
         ("human", "Context:\n{context}\n\nQuestion: {question}")
@@ -325,21 +349,13 @@ def get_rag_chain_response(vector_store, question):
         "context": docs
     }
 
-def get_similarity_scores(vector_store, question, k=10):
+def get_similarity_scores(vector_store, question, k=20):
     """
-    Perform similarity search with scores and deduplicate results.
-    Returns a list of tuples (document, score) with unique content.
+    Perform similarity search, rerank, and return top results with reranked scores.
+    Returns a list of tuples (document, score) for display in UI.
     """
+    # Get initial candidates
     results = vector_store.similarity_search_with_relevance_scores(question, k=k)
     
-    # Deduplicate by content (keep first occurrence = highest score)
-    seen_content = set()
-    unique_results = []
-    for doc, score in results:
-        # Use first 200 chars as fingerprint to catch near-duplicates
-        fingerprint = doc.page_content[:200].strip()
-        if fingerprint not in seen_content:
-            seen_content.add(fingerprint)
-            unique_results.append((doc, score))
-    
-    return unique_results[:3]  # Return max 3 unique results
+    # Rerank and return top 3 with Cross-Encoder scores
+    return rerank_documents(question, results, top_k=3)
