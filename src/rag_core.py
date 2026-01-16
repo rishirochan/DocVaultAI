@@ -12,22 +12,19 @@ from langchain_core.documents import Document
 import torch
 from sentence_transformers import CrossEncoder
 
-# Define Project Roots
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
-PROJECT_ROOT = os.path.dirname(CURRENT_DIR) # Go up from RAG_Dev to root
+PROJECT_ROOT = os.path.dirname(CURRENT_DIR)
 DOCS_DIR = os.path.join(PROJECT_ROOT, "documents")
 VECTOR_STORE_DIR = os.path.join(PROJECT_ROOT, "rag_vector_store")
 ENV_PATH = os.path.join(PROJECT_ROOT, ".env")
 
-# Load environment variables
 load_dotenv(ENV_PATH)
 
-# Initialize reranker at startup (eager load for faster first query)
+# Eager load reranker for faster first query
 RERANKER = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2', activation_fn=torch.nn.Sigmoid())
 
 def get_llm():
     """Initialize and return the Groq LLM."""
-    # Ensure env is loaded
     load_dotenv(ENV_PATH)
     groq_api_key = os.getenv("GROQ_API_KEY")
     if not groq_api_key:
@@ -39,17 +36,12 @@ def get_embeddings():
     return OllamaEmbeddings(model="nomic-embed-text")
 
 def rerank_documents(query, documents, top_k=3, min_score=0.3):
-    """Rerank documents using Cross-Encoder .rank() and return top_k results above min_score."""
+    """Rerank documents using Cross-Encoder and return top_k results above min_score."""
     if not documents:
         return []
     
-    # Extract content for ranking
     passages = [doc.page_content for doc, _ in documents]
-    
-    # Use built-in .rank() method (handles sorting internally)
     ranks = RERANKER.rank(query, passages, top_k=top_k, return_documents=False)
-    
-    # Filter by minimum score and reconstruct (Document, score) tuples
     results = [(documents[r['corpus_id']][0], r['score']) for r in ranks if r['score'] >= min_score]
     
     return results
@@ -63,34 +55,27 @@ def clean_document_text(text):
     - Page headers like "Page 5 of 10"
     - Reference section markers and bibliography entries
     """
-    # Remove inline numeric citations: [1], [2,3], [1-5], [12]
+    # Inline citations: [1], [2,3], [1-5]
     text = re.sub(r'\[\d+(?:[\-,]\s*\d+)*\]', '', text)
     
-    # Remove author-year citations: (Smith, 2020), (Smith et al., 2020)
+    # Author-year citations
     text = re.sub(r'\([A-Z][a-z]+\s+et\s+al\.?,?\s*\d{4}\)', '', text)
     text = re.sub(r'\([A-Z][a-z]+,?\s*\d{4}\)', '', text)
     
-    # Remove standalone page numbers (lines that are just 1-3 digits)
+    # Page numbers and headers
     text = re.sub(r'^\s*\d{1,3}\s*$', '', text, flags=re.MULTILINE)
-    
-    # Remove "Page X" or "Page X of Y" patterns
     text = re.sub(r'[Pp]age\s+\d+(\s+of\s+\d+)?', '', text)
     
-    # Remove common reference section headers (entire line)
+    # Reference sections and bibliography entries
     text = re.sub(r'^(References|Bibliography|Works Cited|Citations)\s*$', '', text, flags=re.MULTILINE | re.IGNORECASE)
-    
-    # Remove bibliography-style entries (lines that look like author lists)
-    # Pattern: "LastName, F. M." or "LastName, FirstName" type entries
     text = re.sub(r'^[A-Z][a-z]+,\s*[A-Z]\..*$', '', text, flags=re.MULTILINE)
-    
-    # Remove lines that are mostly author initials like "Wang, L. C. Lima, C."
     text = re.sub(r'^[A-Z][a-z]+,\s*[A-Z]\.\s*[A-Z]?\.?.*$', '', text, flags=re.MULTILINE)
     
-    # Remove arXiv/DOI references
+    # arXiv/DOI references
     text = re.sub(r'arXiv:\d+\.\d+', '', text)
     text = re.sub(r'doi:\s*\S+', '', text, flags=re.IGNORECASE)
     
-    # Clean up excessive whitespace
+    # Clean whitespace
     text = re.sub(r'\n{3,}', '\n\n', text)
     text = re.sub(r' {2,}', ' ', text)
     
@@ -103,28 +88,24 @@ def get_semantic_chunks(documents, max_chunk_size=1500, min_chunk_size=200):
     2. Split by topic shifts using SemanticChunker
     3. Merge tiny chunks, split oversized chunks
     """
-    # Step 0: Clean each document's text
     for doc in documents:
         doc.page_content = clean_document_text(doc.page_content)
     
-    # Filter out documents with very little content after cleaning
     documents = [doc for doc in documents if len(doc.page_content.strip()) > 50]
-    
     if not documents:
         return []
     
     embeddings = get_embeddings()
     
-    # Step 1: Semantic split by topic (higher threshold = fewer, larger chunks)
+    # Semantic split by topic shifts
     semantic_splitter = SemanticChunker(
         embeddings,
         breakpoint_threshold_type="percentile",
-        breakpoint_threshold_amount=95.0,  # Higher = fewer splits
-        buffer_size=3  # Group more sentences together
+        breakpoint_threshold_amount=95.0,
+        buffer_size=3
     )
     semantic_chunks = semantic_splitter.split_documents(documents)
     
-    # Step 2: Handle chunk sizes
     fallback_splitter = RecursiveCharacterTextSplitter(
         chunk_size=max_chunk_size,
         chunk_overlap=200,
@@ -138,30 +119,25 @@ def get_semantic_chunks(documents, max_chunk_size=1500, min_chunk_size=200):
     for chunk in semantic_chunks:
         content = chunk.page_content.strip()
         
-        # Skip empty chunks
         if len(content) < 10:
             continue
         
-        # If chunk is too small, accumulate it
         if len(content) < min_chunk_size:
             accumulated_text += "\n\n" + content if accumulated_text else content
             if accumulated_metadata is None:
                 accumulated_metadata = chunk.metadata
         else:
-            # First, flush any accumulated small chunks
             if accumulated_text:
                 merged_doc = Document(page_content=accumulated_text, metadata=accumulated_metadata or {})
                 final_chunks.append(merged_doc)
                 accumulated_text = ""
                 accumulated_metadata = None
             
-            # Handle current chunk
             if len(content) > max_chunk_size:
                 final_chunks.extend(fallback_splitter.split_documents([chunk]))
             else:
                 final_chunks.append(chunk)
     
-    # Flush any remaining accumulated text
     if accumulated_text and len(accumulated_text) >= min_chunk_size:
         merged_doc = Document(page_content=accumulated_text, metadata=accumulated_metadata or {})
         final_chunks.append(merged_doc)
@@ -187,7 +163,6 @@ def create_vector_store(doc_dir=DOCS_DIR, persist_dir=VECTOR_STORE_DIR):
     Create a new Chroma vector store from PDFs in the specified directory.
     Returns the new vector store.
     """
-    # Load all PDFs in directory using PyMuPDF
     documents = []
     for filename in os.listdir(doc_dir):
         if filename.lower().endswith('.pdf'):
@@ -214,7 +189,6 @@ def add_documents_to_store(doc_dir, vector_store):
     Load PDFs from doc_dir, split them, and add to the existing vector_store.
     Returns the number of chunks added.
     """
-    # Load all PDFs in directory using PyMuPDF
     documents = []
     for filename in os.listdir(doc_dir):
         if filename.lower().endswith('.pdf'):
@@ -257,15 +231,12 @@ def delete_documents_from_store(filenames_to_delete, vector_store, doc_dir=DOCS_
     
     try:
         collection = vector_store._collection
-        
-        # Get all documents from collection
         all_data = collection.get(include=["metadatas"])
         
         for filename in filenames_to_delete:
             ids_to_delete = []
             for i, meta in enumerate(all_data.get("metadatas", [])):
                 if meta and "source" in meta:
-                    # Match by basename (filename only)
                     if os.path.basename(meta["source"]) == filename:
                         ids_to_delete.append(all_data["ids"][i])
             
@@ -273,7 +244,6 @@ def delete_documents_from_store(filenames_to_delete, vector_store, doc_dir=DOCS_
                 collection.delete(ids=ids_to_delete)
                 deleted_chunks += len(ids_to_delete)
             
-            # Delete PDF from disk
             file_path = os.path.join(doc_dir, filename)
             if os.path.exists(file_path):
                 os.remove(file_path)
@@ -289,7 +259,6 @@ def add_files_to_store(file_paths, vector_store):
     Skips files that are already indexed (checks by filename).
     Returns tuple: (chunks_added, files_skipped)
     """
-    # Get already indexed filenames from vector store metadata
     try:
         collection = vector_store._collection
         existing_data = collection.get(include=["metadatas"])
@@ -325,17 +294,12 @@ def get_rag_chain_response(vector_store, question):
     """
     llm = get_llm()
     
-    # Step 1: Retrieve more candidates (k=20) for reranking
     initial_results = vector_store.similarity_search_with_relevance_scores(question, k=20)
-    
-    # Step 2: Rerank and get top 3
     reranked = rerank_documents(question, initial_results, top_k=3)
     
-    # Step 3: Format context from reranked documents
     docs = [doc for doc, _ in reranked]
     context = "\n\n".join([doc.page_content for doc in docs])
     
-    # Step 4: Create prompt and get response
     prompt = ChatPromptTemplate.from_messages([
         ("system", "Answer the question based on the context provided only. Be accurate and concise."),
         ("human", "Context:\n{context}\n\nQuestion: {question}")
@@ -354,8 +318,5 @@ def get_similarity_scores(vector_store, question, k=20):
     Perform similarity search, rerank, and return top results with reranked scores.
     Returns a list of tuples (document, score) for display in UI.
     """
-    # Get initial candidates
     results = vector_store.similarity_search_with_relevance_scores(question, k=k)
-    
-    # Rerank and return top 3 with Cross-Encoder scores
     return rerank_documents(question, results, top_k=3)
